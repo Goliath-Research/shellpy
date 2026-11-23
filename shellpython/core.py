@@ -1,9 +1,16 @@
 from __future__ import print_function
+import io
 import os
 import sys
 import subprocess
+import threading
 from os import environ as env
 from shellpython import config
+
+try:
+    import queue
+except ImportError:
+    import Queue as queue
 
 _colorama_intialized = False
 _colorama_available = True
@@ -132,6 +139,39 @@ class Stream:
         self._file.flush()
 
 
+class _PipeReader:
+    """Drains a pipe line by line on a background thread.
+
+    Every output pipe of a child must be read continuously: if one fills up while the caller is
+    blocked on another, the child stops writing and both sides wait forever.
+    """
+    def __init__(self, file):
+        self._file = file
+        self._lines = queue.Queue()
+        self._eof = None
+        self._thread = threading.Thread(target=self._drain)
+        self._thread.daemon = True
+        self._thread.start()
+
+    def _drain(self):
+        try:
+            while True:
+                line = self._file.readline()
+                self._lines.put(line)
+                if not line:
+                    break
+        finally:
+            self._file.close()
+
+    def readline(self):
+        if self._eof is not None:
+            return self._eof
+        line = self._lines.get()
+        if not line:
+            self._eof = line
+        return line
+
+
 class InteractiveResult:
     """Result of a shell command execution.
 
@@ -146,11 +186,11 @@ class InteractiveResult:
         self.stdin = Stream(process.stdin, sys.stdin.encoding)
 
         print_stdout = _is_param_set(params, _PARAM_PRINT_STDOUT) or config.PRINT_STDOUT_ALWAYS
-        self.stdout = Stream(process.stdout, sys.stdout.encoding, print_stdout)
+        self.stdout = Stream(_PipeReader(process.stdout), sys.stdout.encoding, print_stdout)
 
         print_stderr = _is_param_set(params, _PARAM_PRINT_STDERR) or config.PRINT_STDERR_ALWAYS
         color = None if not _is_colorama_enabled() else Fore.RED
-        self.stderr = Stream(process.stderr, sys.stderr.encoding, print_stderr, color)
+        self.stderr = Stream(_PipeReader(process.stderr), sys.stderr.encoding, print_stderr, color)
 
     def sreadline(self):
         return self.stdout.sreadline()
@@ -246,19 +286,19 @@ def _create_result(cmd, params):
 
     result = Result()
 
-    for line in p.stdout.readlines():
+    stdout_data, stderr_data = p.communicate()
+
+    for line in io.BytesIO(stdout_data).readlines():
         if sys.version_info[0] == 3:
             line = line.decode(sys.stdout.encoding)
 
         result._add_stdout_line(line)
 
-    for line in p.stderr.readlines():
+    for line in io.BytesIO(stderr_data).readlines():
         if sys.version_info[0] == 3:
             line = line.decode(sys.stderr.encoding)
 
         result._add_stderr_line(line)
-
-    p.wait()
 
     if (_is_param_set(params, _PARAM_PRINT_STDOUT) or config.PRINT_STDOUT_ALWAYS) and len(result.stdout) > 0:
         _print_stdout(result.stdout)
