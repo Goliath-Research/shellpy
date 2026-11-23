@@ -1,7 +1,9 @@
 from __future__ import print_function
+import numbers
 import os
 import sys
 import subprocess
+import threading
 from os import environ as env
 from shellpython import config
 
@@ -37,6 +39,8 @@ _PARAM_INTERACTIVE = 'i'
 # no throw mode. With this parameter user explicitly says that NonZeroReturnCodeError must not be thrown for this
 # specific command. It may be useful if for some reason this command does not return 0 even for successful run
 _PARAM_NO_THROW = 'n'
+
+_READ_CHUNK_BYTES = 8192
 
 
 def exe(cmd, params):
@@ -91,12 +95,44 @@ class NonZeroReturnCodeError(ShellpyError):
                     cmd=self.cmd, code=self.result.returncode, stderr=self.result.stderr)
 
 
+class OutputLimitExceededError(ShellpyError):
+    """This is thrown when a command writes more than config.MAX_CAPTURED_STREAM_BYTES bytes to a captured stream,
+    or a line longer than that in interactive mode. The command is killed, and result holds the output kept up to
+    the limit. It is thrown regardless of the no throw parameter
+    """
+    def __init__(self, cmd, result, stream_name, limit):
+        self.cmd = cmd
+        self.result = result
+        self.stream_name = stream_name
+        self.limit = limit
+
+    def __str__(self):
+        return 'Command \'{cmd}\' wrote more than {limit} bytes to {stream} and was terminated'.format(
+            cmd=self.cmd, limit=self.limit, stream=self.stream_name)
+
+
+def _max_captured_stream_bytes():
+    limit = config.MAX_CAPTURED_STREAM_BYTES
+    if isinstance(limit, bool) or not isinstance(limit, numbers.Integral) or limit < 1:
+        raise ValueError('config.MAX_CAPTURED_STREAM_BYTES must be a positive integer, got {0!r}'.format(limit))
+    return limit
+
+
+def _kill_process(process):
+    try:
+        process.kill()
+    except OSError:
+        pass
+
+
 class Stream:
-    def __init__(self, file, encoding, print_out_stream=False, color=None):
+    def __init__(self, file, encoding, print_out_stream=False, color=None, name=None, on_limit_exceeded=None):
         self._file = file
         self._encoding = encoding
         self._print_out_stream = print_out_stream
         self._color = color
+        self._name = name
+        self._on_limit_exceeded = on_limit_exceeded
 
     def __iter__(self):
         return self
@@ -107,7 +143,14 @@ class Stream:
     __next__ = next
 
     def sreadline(self):
-        line = self._file.readline()
+        limit = _max_captured_stream_bytes()
+        line = self._file.readline(limit + 1)
+        if len(line) > limit:
+            self._file.close()
+            if self._on_limit_exceeded is not None:
+                self._on_limit_exceeded(self._name, limit)
+            raise OutputLimitExceededError(None, None, self._name, limit)
+
         if sys.version_info[0] == 3:
             line = line.decode(self._encoding)
 
@@ -140,17 +183,24 @@ class InteractiveResult:
     You can also iterate over lines of result like this: for line in Result:
     You can compare two results that will mean compare of result strings
     """
-    def __init__(self, process, params):
+    def __init__(self, process, params, cmd=None):
         self._process = process
         self._params = params
+        self._cmd = cmd
         self.stdin = Stream(process.stdin, sys.stdin.encoding)
 
         print_stdout = _is_param_set(params, _PARAM_PRINT_STDOUT) or config.PRINT_STDOUT_ALWAYS
-        self.stdout = Stream(process.stdout, sys.stdout.encoding, print_stdout)
+        self.stdout = Stream(process.stdout, sys.stdout.encoding, print_stdout,
+                             name='stdout', on_limit_exceeded=self._on_limit_exceeded)
 
         print_stderr = _is_param_set(params, _PARAM_PRINT_STDERR) or config.PRINT_STDERR_ALWAYS
         color = None if not _is_colorama_enabled() else Fore.RED
-        self.stderr = Stream(process.stderr, sys.stderr.encoding, print_stderr, color)
+        self.stderr = Stream(process.stderr, sys.stderr.encoding, print_stderr, color,
+                             name='stderr', on_limit_exceeded=self._on_limit_exceeded)
+
+    def _on_limit_exceeded(self, stream_name, limit):
+        _kill_process(self._process)
+        raise OutputLimitExceededError(self._cmd, self, stream_name, limit)
 
     def sreadline(self):
         return self.stdout.sreadline()
@@ -237,7 +287,42 @@ class Result:
     __nonzero__ = __bool__
 
 
+def _read_capped(stream, limit, chunks, on_limit_exceeded):
+    """Reads stream until EOF into chunks, keeping at most limit bytes. Reading stops, the stream is closed and
+    on_limit_exceeded is called as soon as more than limit bytes arrive
+    """
+    fd = stream.fileno()
+    total = 0
+    try:
+        while True:
+            chunk = os.read(fd, min(_READ_CHUNK_BYTES, limit + 1 - total))
+            if not chunk:
+                return
+            total += len(chunk)
+            if total > limit:
+                chunks.append(chunk[:len(chunk) - (total - limit)])
+                on_limit_exceeded()
+                return
+            chunks.append(chunk)
+    finally:
+        stream.close()
+
+
+def _decode_lines(chunks, encoding, truncated):
+    data = b''.join(chunks)
+    del chunks[:]
+    if sys.version_info[0] == 3:
+        data = data.decode(encoding, 'replace' if truncated else 'strict')
+
+    lines = data.split('\n')
+    if lines[-1] == '':
+        lines.pop()
+    return lines
+
+
 def _create_result(cmd, params):
+    limit = _max_captured_stream_bytes()
+
     p = subprocess.Popen(cmd,
                          shell=True,
                          stdout=subprocess.PIPE,
@@ -246,19 +331,40 @@ def _create_result(cmd, params):
 
     result = Result()
 
-    for line in p.stdout.readlines():
-        if sys.version_info[0] == 3:
-            line = line.decode(sys.stdout.encoding)
+    exceeded_streams = []
+    exceeded_lock = threading.Lock()
 
-        result._add_stdout_line(line)
+    def on_limit_exceeded(stream_name):
+        with exceeded_lock:
+            exceeded_streams.append(stream_name)
+        _kill_process(p)
 
-    for line in p.stderr.readlines():
-        if sys.version_info[0] == 3:
-            line = line.decode(sys.stderr.encoding)
-
-        result._add_stderr_line(line)
+    # both pipes are drained at the same time, otherwise a command filling one pipe while the other is read blocks
+    stdout_chunks = []
+    stderr_chunks = []
+    readers = [
+        threading.Thread(target=_read_capped,
+                         args=(p.stdout, limit, stdout_chunks, lambda: on_limit_exceeded('stdout'))),
+        threading.Thread(target=_read_capped,
+                         args=(p.stderr, limit, stderr_chunks, lambda: on_limit_exceeded('stderr'))),
+    ]
+    for reader in readers:
+        reader.daemon = True
+        reader.start()
+    for reader in readers:
+        reader.join()
 
     p.wait()
+    result.returncode = p.returncode
+
+    for line in _decode_lines(stdout_chunks, sys.stdout.encoding, 'stdout' in exceeded_streams):
+        result._add_stdout_line(line)
+
+    for line in _decode_lines(stderr_chunks, sys.stderr.encoding, 'stderr' in exceeded_streams):
+        result._add_stderr_line(line)
+
+    if exceeded_streams:
+        raise OutputLimitExceededError(cmd, result, exceeded_streams[0], limit)
 
     if (_is_param_set(params, _PARAM_PRINT_STDOUT) or config.PRINT_STDOUT_ALWAYS) and len(result.stdout) > 0:
         _print_stdout(result.stdout)
@@ -269,8 +375,6 @@ def _create_result(cmd, params):
         else:
             _print_stderr(result.stderr)
 
-    result.returncode = p.returncode
-
     if p.returncode != 0 and not _is_param_set(params, _PARAM_NO_THROW):
         raise NonZeroReturnCodeError(cmd, result)
 
@@ -280,6 +384,6 @@ def _create_result(cmd, params):
 def _create_interactive_result(cmd, params):
     p = subprocess.Popen(cmd, shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, stdin=subprocess.PIPE)
 
-    result = InteractiveResult(p, params)
+    result = InteractiveResult(p, params, cmd)
 
     return result
